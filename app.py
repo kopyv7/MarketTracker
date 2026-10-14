@@ -2,201 +2,284 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
+import requests
+import plotly.graph_objects as go
 from datetime import datetime, timedelta
+import urllib.request
+import xml.etree.ElementTree as ET
 
-# Configure the Streamlit page layout and settings
+# --- PAGE CONFIG ---
 st.set_page_config(
-    page_title="Market Tracker & Buy Analyzer",
+    page_title="Market Tracker 2.0",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-def calculate_rsi(data, periods=14):
-    """Calculates the Relative Strength Index (RSI) to determine if an asset is overbought or oversold."""
-    close_delta = data['Close'].diff()
-    up = close_delta.clip(lower=0)
-    down = -1 * close_delta.clip(upper=0)
-    
-    if up.empty or down.empty:
-        return pd.Series(dtype='float64')
+def get_ticker_from_search(query):
+    """Searches Yahoo Finance for a company name and returns the ticker symbol."""
+    url = f"https://query2.finance.yahoo.com/v1/finance/search?q={query}"
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+    try:
+        response = requests.get(url, headers=headers, timeout=5)
+        data = response.json()
+        if 'quotes' in data and len(data['quotes']) > 0:
+            for item in data['quotes']:
+                # Find the first real stock/ETF match
+                if item.get('quoteType') in ['EQUITY', 'ETF', 'INDEX', 'MUTUALFUND']:
+                    return item['symbol'], item.get('shortname', item['symbol'])
+    except Exception:
+        pass
+    return query.upper(), query.upper()
 
-    ma_up = up.ewm(com=periods - 1, adjust=True, min_periods=periods).mean()
-    ma_down = down.ewm(com=periods - 1, adjust=True, min_periods=periods).mean()
-    
-    rsi = ma_up / ma_down
-    rsi = 100 - (100 / (1 + rsi))
-    return rsi
+def get_smart_prediction(df):
+    """Calculates technical indicators to recommend BUY, SELL, or KEEP."""
+    if df is None or len(df) < 50:
+        return "KEEP 🟡", "Not enough historical data to run the predictive algorithm."
 
-@st.cache_data(ttl=300) # Cache data for 5 minutes to prevent hitting API limits
-def fetch_market_data(symbol, period="6mo"):
-    """Fetches historical market data and calculates technical indicators."""
+    # Calculate 50-day Simple Moving Average (SMA)
+    df['SMA_50'] = df['Close'].rolling(window=50).mean()
+    
+    # Calculate 14-day Relative Strength Index (RSI)
+    delta = df['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    
+    # Avoid division by zero by replacing 0s with tiny numbers
+    loss = loss.replace(0, 0.00001) 
+    rs = gain / loss
+    df['RSI'] = 100 - (100 / (1 + rs))
+    
+    # Get the most recent values
+    current_price = df['Close'].iloc[-1]
+    current_sma = df['SMA_50'].iloc[-1]
+    current_rsi = df['RSI'].iloc[-1]
+    
+    # Algorithm Logic
+    if current_rsi < 30:
+        action = "BUY 🟢"
+        reason = f"The 14-day RSI is severely oversold at **{current_rsi:.1f}**. The algorithm predicts this asset is currently undervalued and presents a strong buying opportunity for a bounce back."
+    elif current_rsi > 70:
+        action = "SELL 🔴"
+        reason = f"The 14-day RSI is highly overbought at **{current_rsi:.1f}**. The asset has run up quickly, meaning buyers are exhausted and it may be due for a pullback. Consider taking profits."
+    elif current_price > current_sma:
+        action = "KEEP (Bullish) 🟢"
+        reason = f"The current price (${current_price:.2f}) is trending strong above its 50-day average (${current_sma:.2f}). RSI is neutral ({current_rsi:.1f}). The algorithm recommends holding to ride the upward momentum."
+    else:
+        action = "KEEP (Caution) 🟡"
+        reason = f"The asset is weak, trending below its 50-day average (${current_sma:.2f}). However, the RSI is neutral ({current_rsi:.1f}), meaning there is no need to panic sell. The algorithm recommends waiting for a clear reversal before buying more."
+        
+    return action, reason
+
+@st.cache_data(ttl=300)
+def fetch_market_data(symbol, period="1y"):
+    """Fetches historical market data and guarantees news via failsafes."""
     try:
         ticker = yf.Ticker(symbol)
-        df = ticker.history(period=period)
+        df = ticker.history(period="1y") 
         
         if df.empty:
-            return None, [], symbol
+            return None, [], {}, symbol
             
-        # Calculate 50-day Simple Moving Average
-        df['SMA_50'] = df['Close'].rolling(window=50).mean()
-        
-        # Calculate 14-day RSI
-        df['RSI'] = calculate_rsi(df)
-        
-        # Fetch recent news for context
-        news = ticker.news[:3] if hasattr(ticker, 'news') else []
-        
-        # Try to fetch the name of the company/ETF automatically
+        info = {}
         try:
-            name = ticker.info.get('shortName', symbol)
+            info = ticker.info
         except:
-            name = symbol
+            pass
             
-        return df, news, name
-    except Exception as e:
-        st.error(f"Error fetching data for {symbol}: {e}")
-        return None, [], symbol
-
-def analyze_buy_signal(current_price, sma_50, rsi, week_high_52):
-    """Analyzes the indicators to provide a buy recommendation and explain the market state."""
-    reasons = []
-    is_low = False
-    signal = "HOLD / NEUTRAL"
-    color = "normal"
-
-    # RSI Logic (Below 30 is oversold/cheap, Above 70 is overbought/expensive)
-    if rsi < 30:
-        is_low = True
-        reasons.append("RSI is below 30, indicating the asset is strongly oversold (cheap).")
-    elif rsi < 45:
-        reasons.append("RSI is on the lower end, showing cooling momentum.")
-    elif rsi > 70:
-        reasons.append("RSI is above 70, indicating the asset is overbought (expensive).")
-
-    # Moving Average Logic
-    if current_price < sma_50:
-        is_low = True
-        reasons.append(f"Price is trading below its 50-day average (${sma_50:.2f}), showing a short-term downtrend.")
-    else:
-        reasons.append("Price is trading above its 50-day average, showing short-term strength.")
-
-    # Discount from 52-week high
-    discount = ((week_high_52 - current_price) / week_high_52) * 100
-    if discount > 10:
-        is_low = True
-        reasons.append(f"Trading at a {discount:.1f}% discount from its 52-week high.")
-
-    # Determine final signal
-    if is_low and rsi < 40:
-        signal = "STRONG BUY (Market is Low) 🟢"
-        color = "inverse"
-    elif is_low:
-        signal = "ACCUMULATE (Good Entry Point) 🟡"
-    elif rsi > 70:
-        signal = "OVEREXTENDED (Wait for Dip) 🔴"
+        # 1. Try standard yfinance news
+        news = ticker.news[:5] if hasattr(ticker, 'news') else []
         
-    return signal, color, reasons, is_low
+        # 2. FAILSAFE: If standard news is empty, scrape Yahoo RSS directly
+        if not news:
+            try:
+                url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={symbol}&region=US&lang=en-US"
+                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(req, timeout=3) as response:
+                    xml_data = response.read()
+                    root = ET.fromstring(xml_data)
+                    for item in root.findall('.//item')[:5]:
+                        news.append({
+                            'title': item.find('title').text,
+                            'link': item.find('link').text,
+                            'publisher': 'Yahoo Finance RSS'
+                        })
+            except:
+                pass
+                
+        # 3. ULTIMATE FAILSAFE: If offline or blocked, generate a guaranteed fallback link
+        if not news:
+            news = [{
+                'title': f"Latest Live Market Updates for {symbol}",
+                'link': f"https://finance.yahoo.com/quote/{symbol}/news",
+                'publisher': "Yahoo Finance Network"
+            }]
+
+        name = info.get('shortName', symbol)
+        return df, news, info, name
+    except Exception:
+        return None, [], {}, symbol
+
+def create_chart(df, period_key):
+    """Creates a beautiful interactive Apple-Stocks style chart."""
+    now = df.index.max()
+    if period_key == "1W": start_date = now - pd.Timedelta(days=7)
+    elif period_key == "1M": start_date = now - pd.Timedelta(days=30)
+    elif period_key == "3M": start_date = now - pd.Timedelta(days=90)
+    elif period_key == "6M": start_date = now - pd.Timedelta(days=180)
+    elif period_key == "YTD": start_date = pd.to_datetime(f"{now.year}-01-01").tz_localize(df.index.tz)
+    elif period_key == "1Y": start_date = now - pd.Timedelta(days=365)
+    else: start_date = df.index.min()
+
+    chart_df = df[df.index >= start_date]
+    if chart_df.empty: chart_df = df
+
+    # Determine color (Green if up, Red if down)
+    start_price = chart_df['Close'].iloc[0]
+    end_price = chart_df['Close'].iloc[-1]
+    line_color = "#34C759" if end_price >= start_price else "#FF3B30"
+    
+    # Calculate bounds for extreme zooming (removes the flat line problem)
+    min_price = chart_df['Low'].min()
+    max_price = chart_df['High'].max()
+    padding = (max_price - min_price) * 0.05
+    if padding == 0: padding = start_price * 0.01 
+    
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=chart_df.index, 
+        y=chart_df['Close'],
+        mode='lines',
+        line=dict(color=line_color, width=2),
+        fill='tozeroy',
+        fillcolor=f"rgba({52 if line_color=='#34C759' else 255}, {199 if line_color=='#34C759' else 59}, {89 if line_color=='#34C759' else 48}, 0.1)"
+    ))
+
+    fig.update_layout(
+        margin=dict(l=0, r=0, t=0, b=0),
+        height=300,
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)',
+        xaxis=dict(showgrid=False, showticklabels=True, visible=True),
+        yaxis=dict(
+            showgrid=True, 
+            gridcolor='rgba(255,255,255,0.1)', 
+            side='right',
+            range=[min_price - padding, max_price + padding] 
+        ),
+        hovermode='x unified'
+    )
+    return fig, chart_df
 
 def main():
-    st.title("📈 Real-Time ETF & Stock Market Tracker")
-    st.markdown("Track your portfolio, analyze if the market is low, and understand the 'why' behind price movements.")
+    st.title("🤖 AI Market Tracker 2.0")
     
-    # Initialize session state to store our dynamic list of tickers
     if 'symbols' not in st.session_state:
-        st.session_state['symbols'] = ["ZSP.TO", "XEQT.TO", "VDY.TO", "GC=F"]
-    
-    # Sidebar for controls
-    with st.sidebar:
-        st.header("Dashboard Controls")
-        
-        st.markdown("### Add New Asset")
-        new_symbol = st.text_input("Enter Ticker Symbol (e.g. AAPL, NVDA, TSLA):").strip().upper()
-        if st.button("➕ Add Symbol"):
-            if new_symbol and new_symbol not in st.session_state['symbols']:
-                st.session_state['symbols'].append(new_symbol)
-                st.rerun()
-            elif new_symbol in st.session_state['symbols']:
-                st.warning(f"{new_symbol} is already being tracked!")
-                
-        st.markdown("### Manage Assets")
-        symbols_to_remove = st.multiselect("Select symbols to remove:", st.session_state['symbols'])
-        if st.button("🗑️ Remove Selected"):
-            for sym in symbols_to_remove:
-                st.session_state['symbols'].remove(sym)
-            if symbols_to_remove:
-                st.rerun()
-                
-        st.markdown("---")
-        if st.button("🔄 Refresh Data Now"):
-            st.cache_data.clear()
-            st.success("Data refreshed!")
-            
-        st.markdown("---")
-        st.markdown("""
-        **How it works:**
-        - **RSI (Relative Strength Index):** Measures momentum. < 30 means it's heavily sold off (good time to buy).
-        - **50-Day SMA:** Average price over 50 days. Price below this often indicates a dip.
-        """)
+        st.session_state['symbols'] = [{"symbol": "NVDA", "name": "NVIDIA Corporation"}, {"symbol": "AAPL", "name": "Apple Inc."}]
+    if 'timeframes' not in st.session_state:
+        st.session_state['timeframes'] = {}
 
-    for symbol in st.session_state['symbols']:
+    # --- SIDEBAR ---
+    with st.sidebar:
+        st.header("⚙️ Settings & Controls")
         
-        # Fetch data
-        with st.spinner(f"Fetching data for {symbol}..."):
-            result = fetch_market_data(symbol)
-            if result and len(result) == 3:
-                df, news, asset_name = result
-            else:
-                df, news, asset_name = None, [], symbol
-            
+        st.markdown("### 1. Add Company")
+        search_query = st.text_input("Type a company or ticker:").strip()
+        if st.button("➕ Add to Tracker"):
+            if search_query:
+                with st.spinner("Searching..."):
+                    symbol, name = get_ticker_from_search(search_query)
+                    if not any(d['symbol'] == symbol for d in st.session_state['symbols']):
+                        st.session_state['symbols'].append({"symbol": symbol, "name": name})
+                        st.success(f"Added {name} ({symbol})!")
+                        st.rerun()
+                    else:
+                        st.warning("Already tracking this asset.")
+
+        st.markdown("### 2. Manage Tracked Assets")
+        tracked_names = [d['name'] for d in st.session_state['symbols']]
+        to_remove = st.multiselect("Select to remove:", tracked_names)
+        if st.button("🗑️ Remove Selected"):
+            st.session_state['symbols'] = [d for d in st.session_state['symbols'] if d['name'] not in to_remove]
+            st.rerun()
+
+    # --- DASHBOARD ---
+    if not st.session_state['symbols']:
+        st.info("👈 Use the sidebar to search for a company and add it to your dashboard.")
+
+    for asset in st.session_state['symbols']:
+        symbol = asset['symbol']
+        
+        if symbol not in st.session_state['timeframes']:
+            st.session_state['timeframes'][symbol] = "1M"
+
+        df, news, info, real_name = fetch_market_data(symbol)
+        
         if df is not None and not df.empty:
-            st.markdown(f"### {asset_name} (`{symbol}`)")
+            st.markdown(f"---")
             
-            # Extract latest data points
-            current_price = df['Close'].iloc[-1]
-            prev_price = df['Close'].iloc[-2]
-            price_change = current_price - prev_price
-            pct_change = (price_change / prev_price) * 100
+            # Header
+            st.markdown(f"<h2>{real_name} <span style='color:gray; font-size: 0.6em;'>{symbol}</span></h2>", unsafe_allow_html=True)
             
-            latest_rsi = df['RSI'].iloc[-1] if not pd.isna(df['RSI'].iloc[-1]) else 50
-            sma_50 = df['SMA_50'].iloc[-1]
-            high_52 = df['High'].max()
+            # Timeframe selector
+            timeframe = st.radio(
+                "Timeframe",
+                ["1W", "1M", "3M", "6M", "YTD", "1Y"],
+                horizontal=True,
+                key=f"tf_{symbol}",
+                label_visibility="collapsed"
+            )
             
-            # Analyze
-            signal, delta_color, reasons, is_low = analyze_buy_signal(current_price, sma_50, latest_rsi, high_52)
+            # Chart & Metrics
+            fig, chart_df = create_chart(df, timeframe)
+            current_price = chart_df['Close'].iloc[-1]
+            start_price = chart_df['Close'].iloc[0]
+            price_change = current_price - start_price
+            pct_change = (price_change / start_price) * 100
             
-            # Layout metrics
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.metric("Current Price", f"${current_price:.2f}", f"{price_change:.2f} ({pct_change:.2f}%)")
-            with col2:
-                st.metric("14-Day RSI", f"{latest_rsi:.1f}", "Oversold (<30) / Overbought (>70)", delta_color="off")
-            with col3:
-                st.metric("50-Day Avg", f"${sma_50:.2f}")
-            with col4:
-                st.metric("Recommendation", signal)
+            color = "#34C759" if price_change >= 0 else "#FF3B30"
+            sign = "+" if price_change >= 0 else ""
+            st.markdown(f"<h1 style='margin-bottom: 0px;'>${current_price:,.2f}</h1>", unsafe_allow_html=True)
+            st.markdown(f"<h4 style='color: {color}; margin-top: 0px;'>{sign}{price_change:,.2f} ({sign}{pct_change:,.2f}%) <span style='color:gray; font-size:0.6em; font-weight:normal;'>Past {timeframe}</span></h4>", unsafe_allow_html=True)
+            
+            st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
+            
+            # Stats row
+            c1, c2, c3, c4 = st.columns(4)
+            def format_large(num):
+                if pd.isna(num) or num is None: return "-"
+                if num >= 1e12: return f"{num/1e12:.3f}T"
+                if num >= 1e9: return f"{num/1e9:.3f}B"
+                if num >= 1e6: return f"{num/1e6:.3f}M"
+                return f"{num:,.0f}"
+
+            with c1: st.markdown(f"**Open:** ${chart_df['Open'].iloc[-1]:,.2f}  \n**High:** ${chart_df['High'].max():,.2f}  \n**Low:** ${chart_df['Low'].min():,.2f}")
+            with c2: st.markdown(f"**Vol:** {format_large(chart_df['Volume'].iloc[-1])}  \n**Avg Vol:** {format_large(info.get('averageVolume'))}")
+            with c3: st.markdown(f"**P/E:** {info.get('trailingPE', '-')}  \n**Mkt Cap:** {format_large(info.get('marketCap'))}")
+            with c4: st.markdown(f"**52W H:** ${df['High'].max():,.2f}  \n**52W L:** ${df['Low'].min():,.2f}")
                 
-            # Explanation / "Why is it low?" Section
-            with st.expander(f"🧠 Analysis & Why is {symbol} moving?"):
-                st.markdown("#### Technical Breakdown:")
-                for reason in reasons:
-                    st.markdown(f"- {reason}")
-                    
-                st.markdown("#### Market Context / Recent Headlines:")
-                if news:
-                    for article in news:
-                        title = article.get('title', 'No title')
-                        publisher = article.get('publisher', 'Unknown source')
-                        link = article.get('link', '#')
-                        st.markdown(f"- [{title}]({link}) *(Source: {publisher})*")
-                else:
-                    st.info("No recent news headlines found for this ticker right now. The market movement is likely tracking general macroeconomic trends (e.g., interest rates, inflation data).")
+            st.markdown("<br>", unsafe_allow_html=True)
+
+            # 1. Smart Algorithmic Prediction
+            action, reason = get_smart_prediction(df)
             
-            # Chart
-            st.line_chart(df['Close'], height=250, use_container_width=True)
-            st.markdown("---")
+            with st.expander(f"🤖 Smart Prediction for {symbol}", expanded=True):
+                st.markdown(f"### Verdict: {action}")
+                st.write(reason)
+            
+            # 2. Failsafe News Section
+            with st.expander(f"📰 Recent News for {symbol}", expanded=False):
+                for n in news:
+                    title = n.get('title', 'Market Update')
+                    publisher = n.get('publisher', 'Finance Network')
+                    link = n.get('link', '#')
+                    
+                    st.markdown(f"**[{title}]({link})**")
+                    st.markdown(f"<span style='color:gray; font-size: 0.8em;'>{publisher}</span>", unsafe_allow_html=True)
+                    st.write("") 
+                    
         else:
-            st.warning(f"Could not load data for {symbol}. Market might be closed or symbol is invalid.")
+            st.warning(f"Could not load data for {symbol}. The ticker might be invalid.")
 
 if __name__ == "__main__":
     main()
